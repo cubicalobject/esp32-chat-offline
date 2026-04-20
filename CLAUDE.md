@@ -20,6 +20,29 @@ pio run -t uploadfs     # (unused — no SPIFFS/LittleFS in this project)
 
 Everything lives in `src/main.cpp` as a single translation unit. `include/`, `lib/`, `test/` are empty PlatformIO template dirs.
 
+## Headless testing from this dev machine
+
+The captive portal + chat can be driven without a phone, since this machine reaches the internet over Ethernet and the WiFi radio is free. The `ESP32-Chat` profile is already saved on Windows, so no profile XML is needed.
+
+```bash
+netsh wlan connect name="ESP32-Chat"            # join the AP (~2-5s)
+netsh wlan show interfaces | grep -E "SSID|State"
+curl -s http://192.168.4.1/ | head              # sign-in HTML
+curl -s http://chat.local/  | head              # mDNS resolves
+netsh wlan disconnect                           # release the radio when done
+```
+
+For protocol-level verification, write a throwaway `asyncio` + `websockets` script (install once: `py -m pip install websockets`) and drive `ws://192.168.4.1/ws` end-to-end. The happy-path sequence is:
+
+1. recv `{"type":"ready"}`
+2. send `{"type":"register"|"login","name":..,"pass":..}` → recv `{"type":"signedin","name":..,"new":bool}`  *(popup auth — does not join chat)*
+3. open a **second** WS (simulates the user's real browser), recv `ready`, send `{"type":"joinChat"}` → recv `loggedin` + `users` + system join broadcast *(server logs in by IP, no creds re-sent)*
+4. send `{"type":"msg","text":..}` → recv echoed `{"type":"msg",...}`
+5. open a **third** WS, send `joinChat` → the second WS receives `{"type":"taken"}` and is closed (takeover)
+6. send `{"type":"logout"}` → recv `{"type":"loggedout"}`; subsequent `joinChat` from the same IP returns `{"type":"error","code":"nosignin"}` (logout clears the IP allowlist)
+
+When draining messages, catch both `asyncio.TimeoutError` **and** `websockets.exceptions.ConnectionClosed` — `taken` arrives immediately before the close, and a naive recv loop will miss it.
+
 ## Architecture
 
 **Three tiers of user state** (do not conflate them when editing):
