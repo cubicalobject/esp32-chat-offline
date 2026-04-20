@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-ESP32 offline chat server. The board brings up its own WiFi AP (`ESP32-Chat` / `chatroom1`), runs a captive-portal HTTP + WebSocket server at `192.168.4.1`, and mirrors the chat on a 1.54" e-paper display. No internet is involved at runtime.
+ESP32 offline chat server. The board brings up its own WiFi AP (`ESP32-Chat` / `chatroom1`), runs a captive-portal HTTP + WebSocket server reachable at `192.168.4.1` or `http://chat.local` (mDNS), and mirrors the chat on a 1.54" e-paper display. No internet is involved at runtime.
 
 ## Build / flash / monitor
 
@@ -45,19 +45,27 @@ When draining messages, catch both `asyncio.TimeoutError` **and** `websockets.ex
 
 ## Architecture
 
-**Three tiers of user state** (do not conflate them when editing):
+**Four tiers of user state** (do not conflate them when editing):
 
 1. **Accounts** — persistent, stored in NVS (`Preferences` namespace `"chat"`). Key scheme: `ac_count` + `ac_name_N` / `ac_pass_N`. Cap: `MAX_ACCOUNTS = 24`. Passwords are plaintext — noted, not yet hashed.
-2. **Users** — in-RAM active WebSocket sessions, keyed by `AsyncWebSocketClient::id()`. Cap: `MAX_USERS = 8` (this is the chat-room size, not account count).
-3. **History** — in-RAM ring buffer of last `MAX_HISTORY = 12` messages, replayed to each newly-logged-in client.
+2. **Signed-in IPs** — in-RAM `signedIPs[] = {IPAddress, name}`, cap `MAX_SIGNED_IPS = 16`. Populated when the captive popup completes `register`/`login`; cleared by `logout`. Two roles: (a) the chat page's `joinChat` looks up the username by request IP so users don't re-enter creds in their real browser; (b) the OS captive-probe handlers consult this list to return the per-OS success body and clear the "Sign in to network" badge.
+3. **Users** — in-RAM active WebSocket *chat* sessions, keyed by `AsyncWebSocketClient::id()`. Cap: `MAX_USERS = 8` (chat-room size, not account count). The `clientId` field can be **reassigned mid-session** by the takeover path in `joinChat`: a fresh WS for the same name swaps in, the old WS gets `{"type":"taken"}` and is closed. The disconnect handler is safe against this because `findUser(oldId)` returns null after the swap.
+4. **History** — in-RAM ring buffer of last `MAX_HISTORY = 12` messages, replayed to each client when they `joinChat` (not on popup `login`/`register`, which don't enter the chat room).
 
-**WebSocket protocol** (JSON over `/ws`). Inbound `type`: `register` | `login` | `msg`. Outbound `type`: `ready` | `loggedin` | `error` | `msg` | `system` | `users`. All message building is done via string concat in `makeJson` / `buildUserList` — there is no outbound JSON serializer, so any new field must be added there carefully (quote-escaping is manual).
+**WebSocket protocol** (JSON over `/ws`).
+Inbound `type`: `register` | `login` | `joinChat` | `logout` | `msg`. The first two are popup auth only — they validate creds and add to `signedIPs[]` without joining the chat room. `joinChat` is what the chat page sends; the server picks the username from the request IP.
+Outbound `type`: `ready` | `signedin` | `loggedin` | `loggedout` | `taken` | `error` | `msg` | `system` | `users`. `signedin` is the popup's success event; `loggedin` is the chat-page join event; `taken` notifies a kicked WS just before close. `error` may carry a `code` field — currently `"nosignin"` (returned by `joinChat` when the request IP isn't in `signedIPs[]`); the chat page uses it to bounce back to `/`.
+All outbound message building is string concat in `makeJson` / `buildUserList` — there is no outbound JSON serializer, so any new field must be added there carefully (quote-escaping is manual).
 
-**Web UI** is a single HTML+CSS+JS blob in a `PROGMEM` raw string literal (`CHAT_HTML`) inside `main.cpp`. Editing the UI = editing that literal. A second literal `CAPTIVE_HTML` is served to OS captive-portal probe URLs (`/generate_204`, `/hotspot-detect.html`, etc.) so phones auto-open the chat.
+**Web UI** lives in three `PROGMEM` raw string literals inside `main.cpp`:
+- `SIGNIN_HTML` (served at `/`) — the captive-popup auth UI; on `signedin` it shows a success screen with the `chat.local` URL, **no auto-redirect to chat** (the popup is intentionally sandboxed away from the chat).
+- `CHAT_HTML` (served at `/chat`) — the actual chat UI for the user's real browser; on WS `ready` it sends `joinChat` (no creds, server logs in by IP).
+- `CAPTIVE_HTML` — served to OS captive-portal probe URLs (`/generate_204`, `/hotspot-detect.html`, etc.) for clients **not yet** in `signedIPs[]`, so phones auto-open the popup.
+Editing any of those UIs = editing that literal.
 
 **E-paper rendering** uses `GxEPD2` + `U8g2_for_Adafruit_GFX` (needed for the Cyrillic font `u8g2_font_6x13_t_cyrillic`). Pins: `CS=5, DC=17, RST=16, BUSY=4`. Redraws are throttled by a `needsRedraw` dirty flag + `REDRAW_INTERVAL_MS = 2500` min interval — keep that throttle when adding redraw triggers; full-refresh e-paper wears with frequent updates. Line buffer `epdLines[EPD_LINES=13]` is a separate ring from `history[]`.
 
-**DNS + captive portal** — `DNSServer` wildcards all names to the AP IP; `server.onNotFound` redirects stray requests. Together these make any URL the phone tries resolve to the chat page.
+**DNS + mDNS + captive portal** — `DNSServer` wildcards all names to the AP IP, and `MDNS.begin("chat")` advertises `chat.local` on the AP interface. `server.onNotFound` 302s stray HTTP requests to `/` (which itself 302s to `/chat` for already-signed-in IPs). The captive-probe routes (`/generate_204`, `/hotspot-detect.html`, `/ncsi.txt`, `/connecttest.txt`, `/canonical.html`, etc.) are **per-IP**: until that client is in `signedIPs[]` they get `CAPTIVE_HTML` (popup opens); after sign-in they get the OS-specific success body (`HTTP 204` for Android, the `<HTML>...Success...</HTML>` blob for Apple, `Microsoft NCSI` for Windows, `success` for Firefox) so the captive badge clears.
 
 ## Libraries (pinned in `platformio.ini`)
 
