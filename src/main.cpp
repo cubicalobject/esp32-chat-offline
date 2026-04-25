@@ -448,9 +448,43 @@ void onWsEvent(AsyncWebSocket* s, AsyncWebSocketClient* c,
       String text = String(doc["text"] | "");
       text.trim(); text.replace("\"","'");
       if (text.length() == 0 || text.length() > 200) return;
-      storeHistory(u->name, text);
-      broadcast(makeJson("msg", u->name, text));
-      pushLine(u->name, text);
+
+      String toName = String(doc["to"] | "");
+      toName.trim();
+
+      if (toName.length() > 0) {
+        // DM: send only to sender + recipient
+        uint32_t targetId = 0; bool found = false;
+        for (int i = 0; i < MAX_USERS; i++) {
+          if (users[i].active && users[i].name.equalsIgnoreCase(toName)) {
+            targetId = users[i].clientId; toName = users[i].name; found = true; break;
+          }
+        }
+        if (!found) {
+          ws.text(c->id(), "{\"type\":\"error\",\"text\":\"" + toName + " is not online.\"}");
+          return;
+        }
+        String dmJson = makeJson("msg", u->name, text, ",\"to\":\"" + toName + "\",\"dm\":true");
+        ws.text(c->id(), dmJson);
+        if (targetId != c->id()) ws.text(targetId, dmJson);
+      } else {
+        // Public message — scan for @mentions
+        String mentionExtra = ""; bool firstM = true;
+        for (int i = 0; i < MAX_USERS; i++) {
+          if (!users[i].active) continue;
+          String needleLow = "@" + users[i].name; needleLow.toLowerCase();
+          String textLow = text; textLow.toLowerCase();
+          if (textLow.indexOf(needleLow) >= 0) {
+            if (firstM) { mentionExtra += ",\"mentions\":["; firstM = false; }
+            else mentionExtra += ",";
+            mentionExtra += "\"" + users[i].name + "\"";
+          }
+        }
+        if (!firstM) mentionExtra += "]";
+        storeHistory(u->name, text);
+        broadcast(makeJson("msg", u->name, text, mentionExtra));
+        pushLine(u->name, text);
+      }
     }
   }
 }
@@ -680,6 +714,14 @@ body{background:var(--bg);color:var(--text);
 #onlineBar{padding:8px 14px;background:var(--surface);
   border-bottom:1px solid var(--border);font-size:12px;color:var(--muted);
   white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.online-name{cursor:pointer;color:var(--accent);font-weight:500;}
+.online-name:hover{text-decoration:underline;}
+#dmBar{padding:6px 14px;background:#12091f;border-bottom:1px solid #3a1f6e;
+  display:none;align-items:center;gap:8px;font-size:13px;color:#c084fc;}
+#dmBar .dm-to{flex:1;}
+#dmBar button{background:none;border:none;color:var(--muted);font-size:18px;
+  cursor:pointer;line-height:1;padding:0 4px;}
+#dmBar button:hover{color:var(--text);}
 #messages{flex:1;overflow-y:auto;padding:12px 14px;
   display:flex;flex-direction:column;gap:6px;scroll-behavior:smooth;}
 .bubble-wrap{display:flex;flex-direction:column;max-width:82%;}
@@ -689,11 +731,15 @@ body{background:var(--bg);color:var(--text);
 .sender{font-size:11px;color:var(--muted);margin-bottom:3px;padding:0 4px;}
 .bubble{padding:9px 13px;border-radius:16px;font-size:14px;
   line-height:1.45;word-break:break-word;}
-.me   .bubble{background:var(--accent);color:#fff;border-bottom-right-radius:4px;}
+.me .bubble{background:var(--accent);color:#fff;border-bottom-right-radius:4px;}
 .them .bubble{background:var(--them);border:1px solid var(--border);
   border-bottom-left-radius:4px;}
 .system .bubble{background:var(--system);color:var(--muted);font-size:12px;
   border-radius:8px;padding:5px 12px;}
+.me.dm .bubble{background:#9333ea;color:#fff;border-bottom-right-radius:4px;}
+.them.dm .bubble{background:#1e0f33;border:1px solid #6d28d9;
+  color:var(--text);border-bottom-left-radius:4px;}
+.mention-tag{color:#c084fc;font-weight:600;}
 #inputRow{display:flex;gap:8px;padding:10px 12px;
   border-top:1px solid var(--border);background:var(--surface);
   padding-bottom:max(10px,env(safe-area-inset-bottom));}
@@ -716,6 +762,10 @@ body{background:var(--bg);color:var(--text);
     <button id="logoutBtn" onclick="logout()">Log out</button>
   </div>
   <div id="onlineBar">Online: —</div>
+  <div id="dmBar">
+    <span class="dm-to" id="dmLabel"></span>
+    <button onclick="clearDM()" title="Cancel DM">&#x2715;</button>
+  </div>
   <div id="messages"></div>
   <div id="inputRow">
     <input id="msgInput" type="text" maxlength="200"
@@ -726,20 +776,20 @@ body{background:var(--bg);color:var(--text);
 
 <script>
 let ws, myName = '', registered = false, welcomedOnce = false, retryCount = 0;
-let kicked = false;
+let kicked = false, dmTarget = '';
 const messages  = document.getElementById('messages');
 const msgInput  = document.getElementById('msgInput');
 const sendBtn   = document.getElementById('sendBtn');
 const onlineBar = document.getElementById('onlineBar');
 const whoami    = document.getElementById('whoami');
+const dmBar     = document.getElementById('dmBar');
+const dmLabel   = document.getElementById('dmLabel');
+
+if ('Notification' in window) Notification.requestPermission();
 
 function connect() {
   ws = new WebSocket('ws://' + location.host + '/ws');
-  ws.onclose = () => {
-    registered = false;
-    if (kicked) return;
-    setTimeout(connect, 2000);
-  };
+  ws.onclose = () => { registered = false; if (kicked) return; setTimeout(connect, 2000); };
   ws.onerror = () => ws.close();
   ws.onmessage = e => handle(JSON.parse(e.data));
 }
@@ -751,28 +801,18 @@ function sendJoin() {
 
 function handle(d) {
   if (d.type === 'ready') {
-    // Brief delay lets the server finalise any prior disconnect
     setTimeout(sendJoin, 250);
 
   } else if (d.type === 'loggedin') {
-    registered = true;
-    retryCount = 0;
-    myName = d.name;
+    registered = true; retryCount = 0; myName = d.name;
     whoami.textContent = 'Logged in as ' + d.name;
-    if (!welcomedOnce) {
-      addSystem('Welcome, ' + d.name + '! \u2713');
-      welcomedOnce = true;
-    }
+    if (!welcomedOnce) { addSystem('Welcome, ' + d.name + '! \u2713'); welcomedOnce = true; }
     msgInput.focus();
 
   } else if (d.type === 'error') {
-    // No sign-in on this IP → go to sign-in page
     if (d.code === 'nosignin') { location.replace('/'); return; }
-    // Race with previous session still cleaning up — retry briefly
     if (d.text && d.text.toLowerCase().includes('already in chat') && retryCount < 4) {
-      retryCount++;
-      setTimeout(sendJoin, 400);
-      return;
+      retryCount++; setTimeout(sendJoin, 400); return;
     }
     addSystem('Error: ' + (d.text || 'unknown'));
 
@@ -780,14 +820,18 @@ function handle(d) {
     location.replace('/');
 
   } else if (d.type === 'taken') {
-    kicked = true;
-    registered = false;
-    msgInput.disabled = true;
-    sendBtn.disabled = true;
-    addSystem('This chat was opened in another tab — this tab is now inactive.');
+    kicked = true; registered = false; msgInput.disabled = true; sendBtn.disabled = true;
+    addSystem('This chat was opened in another tab \u2014 this tab is now inactive.');
 
   } else if (d.type === 'msg') {
-    addBubble(d.from, d.text, d.from === myName ? 'me' : 'them');
+    const isDM = !!d.dm;
+    const cls = isDM ? (d.from === myName ? 'me dm' : 'them dm')
+                     : (d.from === myName ? 'me' : 'them');
+    addBubble(d.from, d.text, cls, d.to, d.mentions);
+    if (isDM && d.from !== myName)
+      notify('DM from ' + d.from, d.text);
+    else if (!isDM && d.mentions && d.mentions.indexOf(myName) >= 0)
+      notify(d.from + ' mentioned you', d.text);
 
   } else if (d.type === 'system') {
     addSystem(d.text);
@@ -798,21 +842,72 @@ function handle(d) {
   }
 }
 
-function updateOnline(u) {
-  onlineBar.textContent = 'Online: ' + (u.length ? u.join(', ') : 'just you');
+function setDM(name) {
+  if (name === myName) return;
+  dmTarget = name;
+  dmLabel.textContent = '\u2192 ' + name;
+  dmBar.style.display = 'flex';
+  msgInput.placeholder = 'DM \u2192 ' + name + '...';
+  msgInput.focus();
 }
-function addBubble(from, text, cls) {
+function clearDM() {
+  dmTarget = '';
+  dmBar.style.display = 'none';
+  msgInput.placeholder = 'Message / \u0421\u043e\u043e\u0431\u0449\u0435\u043d\u0438\u0435...';
+}
+
+function updateOnline(u) {
+  onlineBar.innerHTML = '';
+  onlineBar.appendChild(document.createTextNode('Online: '));
+  if (!u || !u.length) { onlineBar.appendChild(document.createTextNode('just you')); return; }
+  u.forEach((name, i) => {
+    if (i > 0) onlineBar.appendChild(document.createTextNode(', '));
+    const span = document.createElement('span');
+    span.className = 'online-name';
+    span.textContent = name;
+    span.onclick = () => setDM(name);
+    onlineBar.appendChild(span);
+  });
+}
+
+function notify(title, body) {
+  if (!('Notification' in window) || Notification.permission !== 'granted') return;
+  new Notification(title, { body, tag: 'esp32chat' });
+}
+
+function addBubble(from, text, cls, to, mentions) {
   const wrap = document.createElement('div');
   wrap.className = 'bubble-wrap ' + cls;
-  if (from && cls !== 'me') {
+  const isDM = cls.includes('dm'), isMe = cls.startsWith('me');
+  if (isMe && isDM && to) {
     const s = document.createElement('div');
-    s.className = 'sender'; s.textContent = from; wrap.appendChild(s);
+    s.className = 'sender'; s.textContent = 'DM \u2192 ' + to; wrap.appendChild(s);
+  } else if (!isMe) {
+    const s = document.createElement('div');
+    s.className = 'sender'; s.textContent = isDM ? from + ' \u2192 you' : from;
+    wrap.appendChild(s);
   }
   const b = document.createElement('div');
-  b.className = 'bubble'; b.textContent = text;
+  b.className = 'bubble';
+  renderTextInto(b, text, mentions);
   wrap.appendChild(b); messages.appendChild(wrap);
   messages.scrollTop = messages.scrollHeight;
 }
+
+function renderTextInto(el, text, mentions) {
+  if (!mentions || !mentions.length) { el.textContent = text; return; }
+  const mentionSet = {};
+  mentions.forEach(n => { mentionSet[n.toLowerCase()] = true; });
+  text.split(/(@\S+)/).forEach(part => {
+    if (part.charAt(0) === '@' && mentionSet[part.slice(1).toLowerCase()]) {
+      const span = document.createElement('span');
+      span.className = 'mention-tag'; span.textContent = part; el.appendChild(span);
+    } else {
+      el.appendChild(document.createTextNode(part));
+    }
+  });
+}
+
 function addSystem(text) {
   const wrap = document.createElement('div');
   wrap.className = 'bubble-wrap system';
@@ -827,15 +922,15 @@ function logout() {
   if (ws.readyState === 1) {
     ws.send(JSON.stringify({ type: 'logout' }));
     setTimeout(() => location.replace('/'), 200);
-  } else {
-    location.replace('/');
-  }
+  } else { location.replace('/'); }
 }
 
 function sendMsg() {
   const text = msgInput.value.trim();
   if (!text || !registered) return;
-  ws.send(JSON.stringify({ type: 'msg', text }));
+  const msg = { type: 'msg', text };
+  if (dmTarget) msg.to = dmTarget;
+  ws.send(JSON.stringify(msg));
   msgInput.value = '';
 }
 sendBtn.onclick    = sendMsg;
