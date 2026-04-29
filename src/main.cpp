@@ -70,6 +70,51 @@ struct SignedIP { IPAddress ip; String name; };
 SignedIP signedIPs[MAX_SIGNED_IPS];
 int signedIPCount = 0;
 
+// ── Moderators ────────────────────────────────────────────
+#define MAX_MODS 8
+char modNames[MAX_MODS][17];
+int modCount = 0;
+
+// ── Durak game state ──────────────────────────────────────
+#define MAX_GAMES 3
+#define MAX_GAME_PLAYERS 8
+#define MAX_DECK_SIZE 56
+
+struct AttackSlot { uint8_t atk; uint8_t def; bool defended; };
+
+struct DurakGame {
+  bool       active;
+  bool       inProgress;
+  char       code[9];
+  char       host[17];
+  char       players[MAX_GAME_PLAYERS][17];
+  int        playerCount;
+  int        deckSize;
+  bool       useJokers;
+  uint8_t    deck[MAX_DECK_SIZE];
+  int        deckTop;
+  int        deckTotal;
+  uint8_t    hands[MAX_GAME_PLAYERS][12];
+  int        handSizes[MAX_GAME_PLAYERS];
+  bool       outOfGame[MAX_GAME_PLAYERS];
+  int        activePlayers;
+  uint8_t    trumpCard;
+  uint8_t    trumpSuit;
+  int        attackerIdx;
+  int        defenderIdx;
+  AttackSlot table[6];
+  int        tableCount;
+  bool       defenderTaking;
+  // Players (other than the defender) who have declared "Бито" for the
+  // current "all-defended" state. Reset whenever a new card hits the table
+  // (attack, perevod) or a round ends. Round only ends when every active
+  // non-defender has passed.
+  bool       passed[MAX_GAME_PLAYERS];
+  char       loser[17];
+  bool       done;
+};
+DurakGame games[MAX_GAMES];
+
 int findSignedIPIndex(const IPAddress& ip) {
   for (int i = 0; i < signedIPCount; i++)
     if (signedIPs[i].ip == ip) return i;
@@ -140,6 +185,94 @@ void loadAccountsNVS() {
   }
   prefs.end();
   Serial.println("[NVS] " + String(accountCount) + " accounts loaded.");
+}
+
+// ─────────────────────────────────────────────────────────
+// Moderator NVS helpers
+// ─────────────────────────────────────────────────────────
+void saveModsNVS() {
+  prefs.begin("durak", false);
+  prefs.putUChar("mod_count", (uint8_t)modCount);
+  for (int i = 0; i < modCount; i++)
+    prefs.putString(("mod_" + String(i)).c_str(), modNames[i]);
+  prefs.end();
+}
+void loadModsNVS() {
+  prefs.begin("durak", true);
+  int cnt = (int)prefs.getUChar("mod_count", 0);
+  modCount = 0;
+  for (int i = 0; i < cnt && modCount < MAX_MODS; i++) {
+    String n = prefs.getString(("mod_" + String(i)).c_str(), "");
+    if (n.length() > 0 && n.length() <= 16)
+      n.toCharArray(modNames[modCount++], 17);
+  }
+  prefs.end();
+  if (modCount == 0) { strncpy(modNames[modCount++], "test_1", 17); saveModsNVS(); }
+  Serial.println("[Mods] " + String(modCount) + " loaded.");
+}
+bool isModerator(const String& name) {
+  for (int i = 0; i < modCount; i++)
+    if (name.equalsIgnoreCase(modNames[i])) return true;
+  return false;
+}
+
+// ─────────────────────────────────────────────────────────
+// Card helpers
+// ─────────────────────────────────────────────────────────
+// Suit symbols followed by U+FE0E (text variation selector) — forces phones to
+// render glyphs as text (so CSS color applies) instead of as black emoji.
+static const char* SUIT_SYMS[]  = {
+  "\xe2\x99\xa0\xef\xb8\x8e",  // ♠ + VS15
+  "\xe2\x99\xa5\xef\xb8\x8e",  // ♥ + VS15
+  "\xe2\x99\xa6\xef\xb8\x8e",  // ♦ + VS15
+  "\xe2\x99\xa3\xef\xb8\x8e"   // ♣ + VS15
+};
+static const char* RANKS_16[]   = {"J","Q","K","A"};
+static const char* RANKS_36[]   = {"6","7","8","9","10","J","Q","K","A"};
+static const char* RANKS_52[]   = {"2","3","4","5","6","7","8","9","10","J","Q","K","A"};
+
+inline uint8_t cSuit(uint8_t c) { return c >> 4; }
+inline uint8_t cRank(uint8_t c) { return c & 0x0F; }
+
+String cardStr(uint8_t c, int ds) {
+  if (c == 0xFF) return "Jkr";
+  const char** r = (ds==16)?RANKS_16:(ds==36)?RANKS_36:RANKS_52;
+  return String(SUIT_SYMS[cSuit(c)]) + r[cRank(c)];
+}
+bool canDefend(uint8_t atk, uint8_t def, uint8_t trump) {
+  if (atk == 0xFF) return true;
+  if (def == 0xFF) return true;
+  uint8_t as=cSuit(atk),ar=cRank(atk),ds2=cSuit(def),dr=cRank(def);
+  if (ds2==as && dr>ar) return true;
+  if (ds2==trump && as!=trump) return true;
+  return false;
+}
+void buildAndShuffle(DurakGame& g) {
+  int rc = (g.deckSize==16)?4:(g.deckSize==36)?9:13;
+  g.deckTotal = 0;
+  for (int s=0;s<4;s++) for (int r=0;r<rc;r++) g.deck[g.deckTotal++]=(uint8_t)((s<<4)|r);
+  if (g.useJokers) { g.deck[g.deckTotal++]=0xFF; g.deck[g.deckTotal++]=0xFF; }
+  for (int i=g.deckTotal-1;i>0;i--) {
+    int j=random(i+1); uint8_t t=g.deck[i]; g.deck[i]=g.deck[j]; g.deck[j]=t;
+  }
+  // Trump = last card in the deck. Never let it be a joker or an Ace.
+  uint8_t aceR = (uint8_t)(rc-1);
+  auto badTrump = [&](uint8_t card) {
+    if (card==0xFF) return true;                  // joker
+    if ((card & 0x0F) == aceR) return true;       // Ace
+    return false;
+  };
+  if (badTrump(g.deck[g.deckTotal-1])) {
+    for (int k=g.deckTotal-2;k>=0;k--) {
+      if (!badTrump(g.deck[k])) {
+        uint8_t t=g.deck[g.deckTotal-1]; g.deck[g.deckTotal-1]=g.deck[k]; g.deck[k]=t;
+        break;
+      }
+    }
+  }
+}
+String genCode() {
+  String c; for (int i=0;i<8;i++) c+=String(random(10)); return c;
 }
 
 // ─────────────────────────────────────────────────────────
@@ -299,6 +432,208 @@ void drawBootScreen(const String& ip) {
     u8f.setCursor(2, 150);  u8f.print("or "); u8f.print(ip.c_str());
     u8f.setCursor(2, 170);  u8f.print("Waiting for users...");
   } while (display.nextPage());
+}
+
+// ─────────────────────────────────────────────────────────
+// Durak game logic
+// ─────────────────────────────────────────────────────────
+int nextActive(DurakGame& g, int from) {
+  int cur = (from+1) % g.playerCount;
+  for (int i=0;i<g.playerCount;i++) { if (!g.outOfGame[cur]) return cur; cur=(cur+1)%g.playerCount; }
+  return from;
+}
+DurakGame* findPlayerGame(const String& name) {
+  for (int i=0;i<MAX_GAMES;i++) {
+    if (!games[i].active) continue;
+    for (int p=0;p<games[i].playerCount;p++)
+      if (name.equalsIgnoreCase(games[i].players[p])) return &games[i];
+  }
+  return nullptr;
+}
+int playerIdx(DurakGame& g, const String& name) {
+  for (int i=0;i<g.playerCount;i++) if (name.equalsIgnoreCase(g.players[i])) return i;
+  return -1;
+}
+uint32_t clientForName(const String& name) {
+  for (int i=0;i<MAX_USERS;i++)
+    if (users[i].active && users[i].name.equalsIgnoreCase(name)) return users[i].clientId;
+  return 0;
+}
+
+String buildLobbiesJson() {
+  String j="{\"type\":\"lobbies\",\"games\":["; bool first=true;
+  for (int i=0;i<MAX_GAMES;i++) {
+    if (!games[i].active||games[i].inProgress) continue;
+    if (!first) j+=",";
+    j+="{\"code\":\""+String(games[i].code)+"\",\"host\":\""+games[i].host+
+       "\",\"players\":"+String(games[i].playerCount)+
+       ",\"deck\":"+String(games[i].deckSize)+
+       ",\"jokers\":"+(games[i].useJokers?"true":"false")+"}";
+    first=false;
+  }
+  return j+"]}";
+}
+void broadcastLobbies() { ws.textAll(buildLobbiesJson()); }
+
+void sendLobbyUpdate(DurakGame& g) {
+  String j="{\"type\":\"lobbyUpdate\",\"code\":\""+String(g.code)+
+           "\",\"host\":\""+g.host+"\",\"players\":[";
+  for (int p=0;p<g.playerCount;p++) { if(p)j+=","; j+="\""+String(g.players[p])+"\""; }
+  j+="],\"deck\":"+String(g.deckSize)+",\"jokers\":"+(g.useJokers?"true":"false")+"}";
+  for (int p=0;p<g.playerCount;p++) { uint32_t cid=clientForName(g.players[p]); if(cid)ws.text(cid,j); }
+  broadcastLobbies();
+}
+
+// Forward decls for helpers defined below.
+int passedCount(const DurakGame& g);
+int activeNonDefenderCount(const DurakGame& g);
+
+void sendGameState(DurakGame& g) {
+  uint8_t ts=g.trumpSuit;
+  String trumpSym = (ts<4) ? String(SUIT_SYMS[ts]) : String("?");
+  for (int p=0;p<g.playerCount;p++) {
+    if (g.outOfGame[p]) continue;
+    uint32_t cid=clientForName(g.players[p]);
+    if (!cid) continue;
+    String j="{\"type\":\"gameState\"";
+    j+=",\"hand\":[";
+    for (int i=0;i<g.handSizes[p];i++) { if(i)j+=","; j+="\""+cardStr(g.hands[p][i],g.deckSize)+"\""; }
+    j+="],\"opp\":[";
+    bool first=true;
+    for (int q=0;q<g.playerCount;q++) {
+      if (q==p) continue;
+      if (!first) j+=",";
+      j+="{\"n\":\""+String(g.players[q])+"\",\"out\":"+(g.outOfGame[q]?"true":"false")+
+         ",\"passed\":"+(g.passed[q]?"true":"false")+"}";
+      first=false;
+    }
+    j+="],\"table\":[";
+    for (int i=0;i<g.tableCount;i++) {
+      if(i)j+=",";
+      j+="{\"a\":\""+cardStr(g.table[i].atk,g.deckSize)+"\"";
+      if (g.table[i].defended) j+=",\"d\":\""+cardStr(g.table[i].def,g.deckSize)+"\"";
+      j+="}";
+    }
+    j+="]";
+    j+=",\"trump\":\""+trumpSym+"\"";
+    j+=",\"trumpCard\":\""+cardStr(g.trumpCard,g.deckSize)+"\"";
+    j+=",\"atk\":\""+String(g.players[g.attackerIdx])+"\"";
+    j+=",\"def\":\""+String(g.players[g.defenderIdx])+"\"";
+    j+=",\"deck\":"+String(g.deckTotal-g.deckTop);
+    j+=",\"taking\":"+(g.defenderTaking?String("true"):String("false"));
+    j+=",\"me\":\""+String(g.players[p])+"\"";
+    j+=",\"iPassed\":"+(g.passed[p]?String("true"):String("false"));
+    j+=",\"passN\":"+String(passedCount(g));
+    j+=",\"passT\":"+String(activeNonDefenderCount(g));
+    j+="}";
+    ws.text(cid,j);
+  }
+}
+
+void drawCardsDurak(DurakGame& g) {
+  for (int i=0;i<g.playerCount;i++) {
+    int idx=(g.attackerIdx+i)%g.playerCount;
+    if (g.outOfGame[idx]) continue;
+    while (g.handSizes[idx]<6 && g.deckTop<g.deckTotal)
+      g.hands[idx][g.handSizes[idx]++]=g.deck[g.deckTop++];
+  }
+}
+void checkOutOfGame(DurakGame& g) {
+  if (g.deckTop<g.deckTotal) return;
+  for (int i=0;i<g.playerCount;i++) {
+    if (!g.outOfGame[i] && g.handSizes[i]==0) {
+      g.outOfGame[i]=true; g.activePlayers--;
+      String msg="{\"type\":\"system\",\"text\":\""+String(g.players[i])+" вышел из игры!\"}";
+      for (int p=0;p<g.playerCount;p++) { uint32_t cid=clientForName(g.players[p]); if(cid)ws.text(cid,msg); }
+    }
+  }
+}
+void endGame(DurakGame& g) {
+  if (g.loser[0]==0) {
+    for (int i=0;i<g.playerCount;i++)
+      if (!g.outOfGame[i] && g.handSizes[i]>0) { strncpy(g.loser,g.players[i],17); break; }
+  }
+  g.done=true;
+  String j="{\"type\":\"gameOver\",\"loser\":\""+String(g.loser)+"\"}";
+  for (int p=0;p<g.playerCount;p++) { uint32_t cid=clientForName(g.players[p]); if(cid)ws.text(cid,j); }
+  String loserText = String(g.loser) + " - дурак! \xf0\x9f\x83\x8f";
+  broadcast(makeJson("system", "Server", loserText));
+  storeHistory("Server", loserText);   // persist in chat history
+  pushLine("Server", loserText);       // show on e-paper
+  g.active=false;
+  broadcastLobbies();
+  Serial.println("[Durak] Over. Loser: "+String(g.loser));
+}
+void clearPasses(DurakGame& g) {
+  for (int i=0;i<MAX_GAME_PLAYERS;i++) g.passed[i]=false;
+}
+// Returns true if every active player except the defender has declared "Бито".
+bool allOthersPassed(const DurakGame& g) {
+  for (int i=0;i<g.playerCount;i++) {
+    if (i==g.defenderIdx) continue;
+    if (g.outOfGame[i]) continue;
+    if (!g.passed[i]) return false;
+  }
+  return true;
+}
+int activeNonDefenderCount(const DurakGame& g) {
+  int n=0;
+  for (int i=0;i<g.playerCount;i++) {
+    if (i==g.defenderIdx) continue;
+    if (g.outOfGame[i]) continue;
+    n++;
+  }
+  return n;
+}
+int passedCount(const DurakGame& g) {
+  int n=0;
+  for (int i=0;i<g.playerCount;i++) {
+    if (i==g.defenderIdx) continue;
+    if (g.outOfGame[i]) continue;
+    if (g.passed[i]) n++;
+  }
+  return n;
+}
+
+void advanceTurn(DurakGame& g, bool tookCards) {
+  g.tableCount=0; g.defenderTaking=false;
+  clearPasses(g);
+  drawCardsDurak(g); checkOutOfGame(g);
+  if (g.activePlayers<=1) { endGame(g); return; }
+  if (tookCards) {
+    // defender took cards: they are skipped this round
+    g.attackerIdx = nextActive(g, g.defenderIdx);
+  } else {
+    // Бито: defender successfully defended → they become the new attacker
+    g.attackerIdx = (!g.outOfGame[g.defenderIdx]) ? g.defenderIdx
+                                                  : nextActive(g, g.defenderIdx);
+  }
+  g.defenderIdx = nextActive(g, g.attackerIdx);
+  sendGameState(g);
+}
+void startDurakGame(DurakGame& g) {
+  buildAndShuffle(g);
+  g.deckTop=0;
+  for (int i=0;i<g.playerCount;i++) { g.handSizes[i]=0; g.outOfGame[i]=false; }
+  g.activePlayers=g.playerCount; g.tableCount=0; g.defenderTaking=false;
+  g.done=false; g.loser[0]=0;
+  clearPasses(g);
+  for (int i=0;i<6;i++)
+    for (int p=0;p<g.playerCount;p++)
+      if (g.deckTop<g.deckTotal) g.hands[p][g.handSizes[p]++]=g.deck[g.deckTop++];
+  g.trumpCard = (g.deckTop<g.deckTotal) ? g.deck[g.deckTotal-1] : 0xFF;
+  g.trumpSuit = (g.trumpCard==0xFF) ? 4 : cSuit(g.trumpCard);
+  int best=0; uint8_t bestR=0xFF;
+  for (int p=0;p<g.playerCount;p++)
+    for (int i=0;i<g.handSizes[p];i++) {
+      uint8_t c=g.hands[p][i];
+      if (c!=0xFF && cSuit(c)==g.trumpSuit && cRank(c)<bestR) { bestR=cRank(c); best=p; }
+    }
+  g.attackerIdx=best; g.defenderIdx=nextActive(g,best);
+  g.inProgress=true;
+  String sm="{\"type\":\"gameStarted\",\"code\":\""+String(g.code)+"\"}";
+  for (int p=0;p<g.playerCount;p++) { uint32_t cid=clientForName(g.players[p]); if(cid)ws.text(cid,sm); }
+  sendGameState(g);
 }
 
 // ─────────────────────────────────────────────────────────
@@ -485,6 +820,196 @@ void onWsEvent(AsyncWebSocket* s, AsyncWebSocketClient* c,
         broadcast(makeJson("msg", u->name, text, mentionExtra));
         pushLine(u->name, text);
       }
+
+    // ── Durak: host game ──────────────────────────────────
+    } else if (strcmp(mtype,"hostGame")==0) {
+      String name=lookupSignedName(c->remoteIP());
+      if (name.length()==0) { ws.text(c->id(),"{\"type\":\"error\",\"text\":\"Сначала войдите.\"}"); return; }
+      if (!isModerator(name)) { ws.text(c->id(),"{\"type\":\"error\",\"text\":\"Только для модераторов.\"}"); return; }
+      if (findPlayerGame(name)) { ws.text(c->id(),"{\"type\":\"error\",\"text\":\"Вы уже в игре.\"}"); return; }
+      int slot=-1;
+      for (int i=0;i<MAX_GAMES;i++) if (!games[i].active) { slot=i; break; }
+      if (slot<0) { ws.text(c->id(),"{\"type\":\"error\",\"text\":\"Максимум 3 игры одновременно.\"}"); return; }
+      int ds=doc["deck"]|36;
+      if (ds!=16&&ds!=36&&ds!=52) ds=36;
+      bool jokers=doc["jokers"]|false;
+      DurakGame& g=games[slot];
+      memset(&g,0,sizeof(DurakGame));
+      g.active=true; g.inProgress=false;
+      String code=genCode(); code.toCharArray(g.code,9);
+      name.toCharArray(g.host,17);
+      name.toCharArray(g.players[0],17);
+      g.playerCount=1; g.deckSize=ds; g.useJokers=jokers;
+      sendLobbyUpdate(g);
+      ws.text(c->id(),"{\"type\":\"hostedGame\",\"code\":\""+String(g.code)+"\"}");
+      Serial.println("[Durak] Hosted by "+name+" code="+String(g.code));
+
+    // ── Durak: join game ──────────────────────────────────
+    } else if (strcmp(mtype,"joinGame")==0) {
+      String name=lookupSignedName(c->remoteIP());
+      if (name.length()==0) { ws.text(c->id(),"{\"type\":\"error\",\"text\":\"Сначала войдите.\"}"); return; }
+      if (findPlayerGame(name)) { ws.text(c->id(),"{\"type\":\"error\",\"text\":\"Вы уже в игре.\"}"); return; }
+      String code=String(doc["code"]|"");
+      DurakGame* gp=nullptr;
+      for (int i=0;i<MAX_GAMES;i++)
+        if (games[i].active&&!games[i].inProgress&&String(games[i].code)==code) { gp=&games[i]; break; }
+      if (!gp) { ws.text(c->id(),"{\"type\":\"error\",\"text\":\"Игра не найдена.\"}"); return; }
+      if (gp->playerCount>=MAX_GAME_PLAYERS) { ws.text(c->id(),"{\"type\":\"error\",\"text\":\"Игра заполнена.\"}"); return; }
+      name.toCharArray(gp->players[gp->playerCount++],17);
+      sendLobbyUpdate(*gp);
+
+    // ── Durak: leave game ─────────────────────────────────
+    } else if (strcmp(mtype,"leaveGame")==0) {
+      String name=lookupSignedName(c->remoteIP());
+      if (name.length()==0) return;
+      DurakGame* gp=findPlayerGame(name);
+      if (!gp) return;
+      if (gp->inProgress) { strncpy(gp->loser,name.c_str(),17); endGame(*gp); return; }
+      int idx=playerIdx(*gp,name);
+      if (idx>=0) { for(int i=idx;i<gp->playerCount-1;i++) memcpy(gp->players[i],gp->players[i+1],17); gp->playerCount--; }
+      if (gp->playerCount==0||name.equalsIgnoreCase(gp->host)) { gp->active=false; broadcastLobbies(); }
+      else sendLobbyUpdate(*gp);
+
+    // ── Durak: start game ─────────────────────────────────
+    } else if (strcmp(mtype,"startGame")==0) {
+      String name=lookupSignedName(c->remoteIP());
+      if (name.length()==0) return;
+      DurakGame* gp=findPlayerGame(name);
+      if (!gp||!name.equalsIgnoreCase(gp->host)) { ws.text(c->id(),"{\"type\":\"error\",\"text\":\"Вы не хост.\"}"); return; }
+      if (gp->playerCount<2) { ws.text(c->id(),"{\"type\":\"error\",\"text\":\"Нужно 2 или более игроков.\"}"); return; }
+      startDurakGame(*gp);
+
+    // ── Durak: mod status check ───────────────────────────
+    } else if (strcmp(mtype,"checkMod")==0) {
+      String name=lookupSignedName(c->remoteIP());
+      bool mod=(name.length()>0)&&isModerator(name);
+      ws.text(c->id(),"{\"type\":\"modStatus\",\"isMod\":"+(mod?String("true"):String("false"))+"}");
+
+    // ── Durak: get lobbies ────────────────────────────────
+    } else if (strcmp(mtype,"getLobbies")==0) {
+      ws.text(c->id(),buildLobbiesJson());
+
+    // ── Durak: resync — am I already in a game? ───────────
+    } else if (strcmp(mtype,"getMyGame")==0) {
+      String name=lookupSignedName(c->remoteIP());
+      if (name.length()==0) return;
+      DurakGame* gp=findPlayerGame(name);
+      if (!gp) { ws.text(c->id(),"{\"type\":\"noGame\"}"); return; }
+      if (gp->inProgress) {
+        ws.text(c->id(),"{\"type\":\"gameStarted\"}");
+        sendGameState(*gp);
+      } else {
+        sendLobbyUpdate(*gp);
+      }
+
+    // ── Durak: attack (podkidnoy — any non-defender can throw in) ─────
+    } else if (strcmp(mtype,"attack")==0) {
+      String name=lookupSignedName(c->remoteIP());
+      if (name.length()==0) return;
+      DurakGame* gp=findPlayerGame(name);
+      if (!gp||!gp->inProgress||gp->done) return;
+      int pi=playerIdx(*gp,name);
+      if (pi==gp->defenderIdx) { ws.text(c->id(),"{\"type\":\"error\",\"text\":\"Защитник не может атаковать.\"}"); return; }
+      if (gp->tableCount==0 && pi!=gp->attackerIdx) { ws.text(c->id(),"{\"type\":\"error\",\"text\":\"Только основной атакующий начинает раунд.\"}"); return; }
+      if (gp->tableCount>=6) { ws.text(c->id(),"{\"type\":\"error\",\"text\":\"Максимум 6 карт.\"}"); return; }
+      if (gp->tableCount>=gp->handSizes[gp->defenderIdx]) { ws.text(c->id(),"{\"type\":\"error\",\"text\":\"У защитника недостаточно карт.\"}"); return; }
+      String cardS=String(doc["card"]|"");
+      int ci=-1;
+      for (int i=0;i<gp->handSizes[pi];i++) if (cardStr(gp->hands[pi][i],gp->deckSize)==cardS) { ci=i; break; }
+      if (ci<0) { ws.text(c->id(),"{\"type\":\"error\",\"text\":\"Карта не найдена.\"}"); return; }
+      if (gp->tableCount>0) {
+        uint8_t myR=(gp->hands[pi][ci]==0xFF)?0xFF:cRank(gp->hands[pi][ci]);
+        bool ok=false;
+        for (int i=0;i<gp->tableCount;i++) {
+          if (((gp->table[i].atk==0xFF)?0xFF:cRank(gp->table[i].atk))==myR) { ok=true; break; }
+          if (gp->table[i].defended && ((gp->table[i].def==0xFF)?0xFF:cRank(gp->table[i].def))==myR) { ok=true; break; }
+        }
+        if (!ok) { ws.text(c->id(),"{\"type\":\"error\",\"text\":\"Достоинство должно совпадать с картами на столе.\"}"); return; }
+      }
+      uint8_t card=gp->hands[pi][ci];
+      for (int i=ci;i<gp->handSizes[pi]-1;i++) gp->hands[pi][i]=gp->hands[pi][i+1]; gp->handSizes[pi]--;
+      gp->table[gp->tableCount++]={card,0,false};
+      clearPasses(*gp);  // new card on table — everyone gets to vote again
+      sendGameState(*gp);
+
+    // ── Durak: defend ─────────────────────────────────────
+    } else if (strcmp(mtype,"defend")==0) {
+      String name=lookupSignedName(c->remoteIP());
+      if (name.length()==0) return;
+      DurakGame* gp=findPlayerGame(name);
+      if (!gp||!gp->inProgress||gp->done) return;
+      int pi=playerIdx(*gp,name);
+      if (pi!=gp->defenderIdx) { ws.text(c->id(),"{\"type\":\"error\",\"text\":\"Не ваш ход.\"}"); return; }
+      int slot=doc["slot"]|-1;
+      if (slot<0||slot>=gp->tableCount||gp->table[slot].defended) { ws.text(c->id(),"{\"type\":\"error\",\"text\":\"Неверный слот.\"}"); return; }
+      String cardS=String(doc["card"]|"");
+      int ci=-1;
+      for (int i=0;i<gp->handSizes[pi];i++) if (cardStr(gp->hands[pi][i],gp->deckSize)==cardS) { ci=i; break; }
+      if (ci<0) { ws.text(c->id(),"{\"type\":\"error\",\"text\":\"Карта не найдена.\"}"); return; }
+      if (!canDefend(gp->table[slot].atk,gp->hands[pi][ci],gp->trumpSuit)) { ws.text(c->id(),"{\"type\":\"error\",\"text\":\"Эту карту не побить.\"}"); return; }
+      gp->table[slot].def=gp->hands[pi][ci]; gp->table[slot].defended=true;
+      for (int i=ci;i<gp->handSizes[pi]-1;i++) gp->hands[pi][i]=gp->hands[pi][i+1]; gp->handSizes[pi]--;
+      sendGameState(*gp);
+
+    // ── Durak: pass (any non-defender votes "Бито") ───────
+    } else if (strcmp(mtype,"pass")==0) {
+      String name=lookupSignedName(c->remoteIP());
+      if (name.length()==0) return;
+      DurakGame* gp=findPlayerGame(name);
+      if (!gp||!gp->inProgress||gp->done) return;
+      int pi=playerIdx(*gp,name);
+      if (pi==gp->defenderIdx) { ws.text(c->id(),"{\"type\":\"error\",\"text\":\"Защитник не голосует.\"}"); return; }
+      if (gp->outOfGame[pi]) return;
+      if (gp->tableCount==0) return;
+      bool allDef=true;
+      for (int i=0;i<gp->tableCount;i++) if (!gp->table[i].defended) { allDef=false; break; }
+      if (!allDef) { ws.text(c->id(),"{\"type\":\"error\",\"text\":\"Не все карты побиты.\"}"); return; }
+      gp->passed[pi]=true;
+      if (allOthersPassed(*gp)) advanceTurn(*gp,false);
+      else sendGameState(*gp);
+
+    // ── Durak: perevod ────────────────────────────────────
+    } else if (strcmp(mtype,"perevod")==0) {
+      String name=lookupSignedName(c->remoteIP());
+      if (name.length()==0) return;
+      DurakGame* gp=findPlayerGame(name);
+      if (!gp||!gp->inProgress||gp->done) return;
+      int pi=playerIdx(*gp,name);
+      if (pi!=gp->defenderIdx) { ws.text(c->id(),"{\"type\":\"error\",\"text\":\"Не ваш ход.\"}"); return; }
+      for (int i=0;i<gp->tableCount;i++) if (gp->table[i].defended) { ws.text(c->id(),"{\"type\":\"error\",\"text\":\"Перевод невозможен после защиты.\"}"); return; }
+      String cardS=String(doc["card"]|"");
+      int ci=-1;
+      for (int i=0;i<gp->handSizes[pi];i++) if (cardStr(gp->hands[pi][i],gp->deckSize)==cardS) { ci=i; break; }
+      if (ci<0) { ws.text(c->id(),"{\"type\":\"error\",\"text\":\"Карта не найдена.\"}"); return; }
+      uint8_t myCard=gp->hands[pi][ci];
+      uint8_t myR=(myCard==0xFF)?0xFF:cRank(myCard);
+      bool rankOk=false;
+      for (int i=0;i<gp->tableCount;i++) if (((gp->table[i].atk==0xFF)?0xFF:cRank(gp->table[i].atk))==myR) { rankOk=true; break; }
+      if (!rankOk) { ws.text(c->id(),"{\"type\":\"error\",\"text\":\"Достоинство должно совпадать с атакой.\"}"); return; }
+      // In 2-player perevod, nextDef is the original attacker (roles just swap).
+      int nextDef=nextActive(*gp,pi);
+      if (nextDef==pi) { ws.text(c->id(),"{\"type\":\"error\",\"text\":\"Нет другого игрока.\"}"); return; }
+      if (gp->tableCount+1>gp->handSizes[nextDef]) { ws.text(c->id(),"{\"type\":\"error\",\"text\":\"У следующего игрока недостаточно карт.\"}"); return; }
+      uint8_t card=gp->hands[pi][ci];
+      for (int i=ci;i<gp->handSizes[pi]-1;i++) gp->hands[pi][i]=gp->hands[pi][i+1]; gp->handSizes[pi]--;
+      gp->table[gp->tableCount++]={card,0,false};
+      gp->attackerIdx=pi; gp->defenderIdx=nextDef;
+      clearPasses(*gp);
+      sendGameState(*gp);
+
+    // ── Durak: take ───────────────────────────────────────
+    } else if (strcmp(mtype,"take")==0) {
+      String name=lookupSignedName(c->remoteIP());
+      if (name.length()==0) return;
+      DurakGame* gp=findPlayerGame(name);
+      if (!gp||!gp->inProgress||gp->done) return;
+      int pi=playerIdx(*gp,name);
+      if (pi!=gp->defenderIdx) return;
+      for (int i=0;i<gp->tableCount;i++) {
+        if (gp->handSizes[pi]<12) gp->hands[pi][gp->handSizes[pi]++]=gp->table[i].atk;
+        if (gp->table[i].defended&&gp->handSizes[pi]<12) gp->hands[pi][gp->handSizes[pi]++]=gp->table[i].def;
+      }
+      advanceTurn(*gp,true);
     }
   }
 }
@@ -582,10 +1107,10 @@ body{background:var(--bg);color:var(--text);
   <h2 id="doneTitle">Signed in</h2>
   <div class="who" id="doneWho"></div>
   <div class="step">
-    Open your phone's browser and go to
-    <span class="url">http://chat.local</span>
+    Open your phone's browser and tap
+    <a href="http://chat.local/chat" class="url">http://chat.local</a>
     <span style="display:block;font-size:11px;color:#444;margin-top:6px;">
-      (or <span style="color:#7c6af7;font-family:monospace;">http://192.168.4.1</span>)
+      (or <a href="http://192.168.4.1/chat" style="color:#7c6af7;font-family:monospace;text-decoration:underline;">http://192.168.4.1</a>)
     </span>
   </div>
   <div class="alt">
@@ -759,7 +1284,11 @@ body{background:var(--bg);color:var(--text);
       <span class="title">ESP32 Chat</span>
       <span class="whoami" id="whoami"></span>
     </div>
-    <button id="logoutBtn" onclick="logout()">Log out</button>
+    <div style="display:flex;gap:8px;">
+      <a href="/durak" style="padding:6px 12px;border:1px solid var(--border);border-radius:8px;
+        background:transparent;color:var(--accent);font-size:12px;text-decoration:none;">&#9824;&#xFE0E; Дурак</a>
+      <button id="logoutBtn" onclick="logout()">Log out</button>
+    </div>
   </div>
   <div id="onlineBar">Online: —</div>
   <div id="dmBar">
@@ -961,6 +1490,433 @@ display:flex;align-items:center;justify-content:center;height:100vh;margin:0;">
 )rawliteral";
 
 // ─────────────────────────────────────────────────────────
+// Durak page HTML  (served at /durak)
+// ─────────────────────────────────────────────────────────
+const char DURAK_HTML[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+<title>Durak</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0;}
+:root{--bg:#0d0d0d;--surface:#141414;--border:#222;--text:#e8e8e8;--muted:#777;
+  --accent:#7c6af7;--red:#ef4444;--green:#22c55e;
+  --r-atk:#f59e0b;       /* main attacker — amber */
+  --r-def:#3b82f6;       /* defender — blue */
+  --r-thrower:#22c55e;   /* throw-in eligible — green */
+}
+body{background:var(--bg);color:var(--text);
+  font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+  font-size:16px;
+  height:100dvh;display:flex;flex-direction:column;overflow:hidden;}
+header{padding:12px 16px;background:var(--surface);border-bottom:1px solid var(--border);
+  display:flex;align-items:center;justify-content:space-between;}
+header .title{font-size:20px;font-weight:600;}
+header a{color:var(--muted);font-size:15px;text-decoration:none;}
+header a:hover{color:var(--text);}
+.section-title{font-size:14px;color:var(--muted);text-transform:uppercase;
+  letter-spacing:.06em;margin-bottom:10px;}
+.game-card{background:var(--surface);border:1px solid var(--border);border-radius:10px;
+  padding:14px 16px;margin-bottom:10px;display:flex;align-items:center;gap:10px;}
+.game-card .info{flex:1;}
+.game-card .code{font-family:monospace;font-size:19px;font-weight:600;color:var(--accent);}
+.game-card .meta{font-size:14px;color:var(--muted);margin-top:3px;}
+.btn{padding:11px 18px;border:none;border-radius:8px;font-size:16px;font-weight:500;
+  cursor:pointer;background:var(--accent);color:#fff;}
+.btn:active{opacity:.8;} .btn:disabled{opacity:.4;cursor:default;}
+.btn.secondary{background:var(--surface);border:1px solid var(--border);color:var(--text);}
+.btn.danger{background:var(--red);}
+.btn.sm{padding:8px 14px;font-size:14px;}
+input[type=text],select{width:100%;padding:13px 14px;background:var(--surface);
+  border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:16px;
+  outline:none;margin-bottom:10px;}
+input[type=text]:focus,select:focus{border-color:var(--accent);}
+.row{display:flex;gap:8px;align-items:center;}
+.row label{font-size:15px;color:var(--muted);}
+.err{font-size:15px;color:var(--red);margin-bottom:8px;min-height:18px;}
+#roomCode{font-family:monospace;font-size:36px;font-weight:700;color:var(--accent);
+  letter-spacing:4px;text-align:center;padding:18px 0;}
+.player-pill{display:inline-block;padding:6px 12px;background:var(--surface);
+  border:1px solid var(--border);border-radius:20px;font-size:15px;margin:4px;}
+#trumpBar{padding:8px 16px;background:#12091f;border-bottom:1px solid #3a1f6e;
+  font-size:15px;color:#c084fc;display:flex;gap:14px;flex-wrap:wrap;align-items:center;}
+.role-pill{padding:3px 10px;border-radius:12px;font-size:13px;font-weight:600;
+  border:1px solid currentColor;}
+.role-pill.atk{color:var(--r-atk);}
+.role-pill.def{color:var(--r-def);}
+.role-pill.thrower{color:var(--r-thrower);}
+.role-pill.spectator{color:var(--muted);}
+#oppRow{padding:8px 14px;border-bottom:1px solid var(--border);
+  display:flex;gap:10px;overflow-x:auto;}
+.opp-box{text-align:center;min-width:64px;padding:6px 8px;border-radius:10px;
+  border:2px solid var(--border);background:#0f0f0f;}
+.opp-box .opp-name{font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;
+  text-overflow:ellipsis;max-width:80px;}
+.opp-box .opp-role{font-size:10px;text-transform:uppercase;letter-spacing:.05em;
+  margin-top:2px;}
+.opp-box .opp-back{font-size:26px;line-height:1;margin-top:3px;color:#9ca3af;}
+.opp-box.r-atk{border-color:var(--r-atk);}
+.opp-box.r-atk .opp-name,.opp-box.r-atk .opp-role{color:var(--r-atk);}
+.opp-box.r-def{border-color:var(--r-def);}
+.opp-box.r-def .opp-name,.opp-box.r-def .opp-role{color:var(--r-def);}
+.opp-box.r-thrower{border-color:var(--r-thrower);}
+.opp-box.r-thrower .opp-name,.opp-box.r-thrower .opp-role{color:var(--r-thrower);}
+.opp-box.passed{background:#0d2010;}
+.opp-box.passed::after{content:'\2713 Бито';display:block;font-size:11px;
+  color:var(--r-thrower);margin-top:2px;}
+.opp-box.out{opacity:.35;border-color:var(--border);}
+#tableArea{flex:1;overflow-y:auto;padding:12px 16px;display:flex;flex-wrap:wrap;gap:10px;
+  align-content:flex-start;}
+.slot{background:var(--surface);border:1px solid var(--border);border-radius:8px;
+  padding:8px 10px;min-width:60px;text-align:center;cursor:pointer;}
+.slot.selected{border-color:var(--accent);box-shadow:0 0 0 2px rgba(124,106,247,0.3);}
+.slot .atk{font-size:18px;font-weight:600;}
+.slot .def{font-size:15px;color:var(--green);margin-top:3px;}
+#statusBar{padding:10px 16px;font-size:15px;color:var(--text);font-weight:500;
+  border-top:1px solid var(--border);background:#101010;}
+#handArea{padding:10px 14px 4px;display:flex;gap:8px;overflow-x:auto;
+  border-top:1px solid var(--border);}
+.card-btn{padding:12px 14px;background:var(--surface);border:1px solid var(--border);
+  border-radius:8px;font-size:20px;font-weight:600;cursor:pointer;white-space:nowrap;flex-shrink:0;}
+.card-btn.selected{border-color:var(--accent);background:#1a1040;
+  box-shadow:0 0 0 2px rgba(124,106,247,0.3);}
+.card-btn{color:#e8e8e8;}
+.card-btn.red{color:#f87171;}
+.atk{color:#e8e8e8;}
+.atk.red{color:#f87171;}
+.def{color:#22c55e;}
+#actionBar{padding:10px 14px 12px;display:flex;gap:8px;flex-wrap:wrap;
+  border-top:1px solid var(--border);}
+</style>
+</head>
+<body>
+<header>
+  <span class="title">&#9824;&#xFE0E; Дурак</span>
+  <a href="/chat">&#8592; Чат</a>
+</header>
+
+<div id="viewLobby" style="flex:1;overflow-y:auto;padding:14px;">
+  <div class="section-title">Открытые игры</div>
+  <div id="gamesList"><p style="color:var(--muted);font-size:13px;">Нет открытых игр.</p></div>
+  <div id="modPanel" style="display:none;margin-top:14px;">
+    <div class="section-title">Создать новую игру</div>
+    <div class="err" id="hostErr"></div>
+    <label style="font-size:13px;color:var(--muted);display:block;margin-bottom:4px;">Размер колоды</label>
+    <select id="deckSel"><option value="36">36 карт (6&ndash;Т)</option><option value="52">52 карты (2&ndash;Т)</option><option value="16">16 карт (В&ndash;Т)</option></select>
+    <div class="row" style="margin-bottom:10px;">
+      <input type="checkbox" id="jokersCb" style="width:auto;margin:0;">
+      <label for="jokersCb">Добавить 2 джокера (бьют любую защиту, любая карта бьёт их)</label>
+    </div>
+    <button class="btn" onclick="hostGame()">Создать игру</button>
+  </div>
+  <div style="margin-top:14px;">
+    <div class="section-title">Войти по коду</div>
+    <div class="err" id="joinErr"></div>
+    <div class="row">
+      <input type="text" id="codeInput" placeholder="8-значный код..." maxlength="8"
+        style="margin:0;flex:1;" oninput="this.value=this.value.replace(/\D/g,'')">
+      <button class="btn sm" onclick="joinGame()">Войти</button>
+    </div>
+  </div>
+</div>
+
+<div id="viewRoom" style="display:none;flex:1;overflow-y:auto;padding:14px;">
+  <div class="section-title">Код игры &mdash; поделитесь с друзьями</div>
+  <div id="roomCode"></div>
+  <div style="text-align:center;font-size:12px;color:var(--muted);margin-top:-8px;margin-bottom:14px;">
+    Войти можно на странице <b>chat.local/durak</b>
+  </div>
+  <div class="section-title" style="display:flex;justify-content:space-between;align-items:baseline;">
+    <span>Игроки</span>
+    <span id="roomCount" style="font-weight:600;color:var(--text);text-transform:none;letter-spacing:0;"></span>
+  </div>
+  <div id="roomPlayers" style="margin-bottom:8px;"></div>
+  <div style="font-size:12px;color:var(--muted);" id="roomMeta"></div>
+  <div id="roomWaiting" style="margin-top:14px;padding:10px;background:var(--surface);border:1px dashed var(--border);border-radius:8px;text-align:center;font-size:13px;color:var(--muted);"></div>
+  <div class="err" id="roomErr" style="margin-top:8px;"></div>
+  <div style="margin-top:14px;display:flex;gap:8px;flex-wrap:wrap;">
+    <button class="btn" id="startBtn" onclick="startGame()" style="display:none;">Начать игру</button>
+    <button class="btn danger sm" onclick="leaveGame()">Выйти</button>
+  </div>
+</div>
+
+<div id="viewGame" style="display:none;flex:1;flex-direction:column;">
+  <div id="trumpBar">
+    <span id="trumpLabel">Козырь: &mdash;</span>
+    <span id="deckLabel">Колода: &mdash;</span>
+    <span id="myRolePill" class="role-pill spectator">Вы: &mdash;</span>
+  </div>
+  <div id="oppRow"></div>
+  <div id="tableArea"></div>
+  <div id="gameErr" style="display:none;padding:6px 14px;background:#3b0f0f;color:#fca5a5;font-size:12px;border-top:1px solid #5a1a1a;"></div>
+  <div id="statusBar">Ожидание...</div>
+  <div id="handArea"></div>
+  <div id="actionBar"></div>
+</div>
+
+<script>
+let ws, myName='', isMod=false;
+let gameState=null, selectedCard=null, selectedSlot=-1;
+let inRoom=false, myRoomCode='';
+
+function show(id) {
+  ['viewLobby','viewRoom','viewGame'].forEach(v=>{
+    const el=document.getElementById(v);
+    el.style.display=(v===id)?'flex':'none';
+    if (v===id) el.style.flexDirection='column';
+  });
+}
+
+function connect() {
+  ws=new WebSocket('ws://'+location.host+'/ws');
+  ws.onclose=()=>setTimeout(connect,2000);
+  ws.onerror=()=>ws.close();
+  ws.onmessage=e=>handle(JSON.parse(e.data));
+}
+connect();
+
+function send(obj){ if(ws.readyState===1) ws.send(JSON.stringify(obj)); }
+
+function handle(d) {
+  if (d.type==='ready') {
+    send({type:'joinChat'});
+    send({type:'getLobbies'});
+  } else if (d.type==='loggedin') {
+    myName=d.name;
+    send({type:'checkMod'});
+    send({type:'getMyGame'});
+  } else if (d.type==='noGame') {
+    // not in a game — stay on lobby view
+  } else if (d.type==='modStatus') {
+    isMod=!!d.isMod;
+    document.getElementById('modPanel').style.display=isMod?'block':'none';
+  } else if (d.type==='error') {
+    if (d.code==='nosignin') { location.replace('/'); return; }
+    const txt=d.text||'Error';
+    document.getElementById('hostErr').textContent=txt;
+    document.getElementById('joinErr').textContent=txt;
+    document.getElementById('roomErr').textContent=txt;
+    const ge=document.getElementById('gameErr');
+    if (ge) {
+      ge.textContent=txt;
+      ge.style.display='block';
+      clearTimeout(window._gameErrT);
+      window._gameErrT=setTimeout(()=>{ ge.style.display='none'; }, 3500);
+    }
+  } else if (d.type==='lobbies') {
+    renderLobbies(d.games);
+  } else if (d.type==='hostedGame') {
+    myRoomCode=d.code; inRoom=true;
+    show('viewRoom');
+  } else if (d.type==='lobbyUpdate') {
+    renderRoom(d);
+    if (!inRoom || myRoomCode===d.code) { inRoom=true; myRoomCode=d.code; show('viewRoom'); }
+  } else if (d.type==='gameStarted') {
+    show('viewGame');
+  } else if (d.type==='gameState') {
+    gameState=d; renderGame();
+  } else if (d.type==='gameOver') {
+    show('viewLobby');
+    inRoom=false; myRoomCode='';
+    send({type:'getLobbies'});
+    alert((d.loser===myName?'Вы - дурак':d.loser+' - дурак')+'! 🃏');
+  }
+}
+
+function renderLobbies(games) {
+  const el=document.getElementById('gamesList');
+  if (!games||!games.length) { el.innerHTML='<p style="color:var(--muted);font-size:13px;">Нет открытых игр.</p>'; return; }
+  el.innerHTML='';
+  games.forEach(g=>{
+    const div=document.createElement('div');
+    div.className='game-card';
+    div.innerHTML=`<div class="info"><div class="code">${g.code}</div>
+      <div class="meta">Хост: ${g.host} &nbsp;|&nbsp; ${g.players}/8 игроков &nbsp;|&nbsp; ${g.deck} карт${g.jokers?' + джокеры':''}</div>
+      </div><button class="btn sm" onclick="joinByCode('${g.code}')">Войти</button>`;
+    el.appendChild(div);
+  });
+}
+
+function renderRoom(d) {
+  document.getElementById('roomCode').textContent=d.code;
+  const players=d.players||[];
+  document.getElementById('roomCount').textContent=`${players.length}/8`;
+  const pp=document.getElementById('roomPlayers');
+  pp.innerHTML='';
+  players.forEach(n=>{
+    const span=document.createElement('span');
+    span.className='player-pill';
+    let label=n;
+    if (n===d.host) label+=' (хост)';
+    if (n===myName) label+=' &mdash; вы';
+    span.innerHTML=label;
+    pp.appendChild(span);
+  });
+  document.getElementById('roomMeta').textContent=`Колода: ${d.deck} карт${d.jokers?' + джокеры':''}`;
+  const isHost=(myName===d.host);
+  const sb=document.getElementById('startBtn');
+  sb.style.display=isHost?'inline-block':'none';
+  sb.disabled=players.length<2;
+  sb.textContent=players.length<2?'Нужно ещё игроков':`Начать игру (${players.length})`;
+  const w=document.getElementById('roomWaiting');
+  if (isHost) {
+    w.textContent=players.length<2
+      ? 'Ожидание игроков... поделитесь кодом выше.'
+      : 'Можно начинать! Или дождитесь ещё игроков.';
+  } else {
+    w.textContent='Ожидайте, пока хост начнёт игру.';
+  }
+}
+
+function suitColor(card) {
+  return (card.startsWith('♥')||card.startsWith('♦'))?'red':'';
+}
+
+function renderGame() {
+  const d=gameState;
+  if (!d) return;
+  document.getElementById('trumpLabel').textContent=`Козырь: ${d.trump} (${d.trumpCard})`;
+  document.getElementById('deckLabel').textContent=`Колода: ${d.deck}`;
+
+  // Show "you are: <role>" pill
+  const isAtk=(d.me===d.atk), isDef=(d.me===d.def);
+  const myRolePill=document.getElementById('myRolePill');
+  if (myRolePill) {
+    let cls='spectator', txt='наблюдатель';
+    if (isAtk) { cls='atk'; txt='атакующий'; }
+    else if (isDef) { cls='def'; txt='защитник'; }
+    else if (d.table && d.table.length>0) { cls='thrower'; txt='подкидной'; }
+    myRolePill.className='role-pill '+cls;
+    myRolePill.textContent='Вы: '+txt;
+  }
+
+  const opp=document.getElementById('oppRow');
+  opp.innerHTML='';
+  (d.opp||[]).forEach(o=>{
+    const div=document.createElement('div');
+    let role='', label='';
+    if (o.n===d.atk) { role='r-atk'; label='атакующий'; }
+    else if (o.n===d.def) { role='r-def'; label='защитник'; }
+    else if (d.table && d.table.length>0) { role='r-thrower'; label='подкидной'; }
+    const passedCls=(o.passed?' passed':'');
+    div.className='opp-box '+role+(o.out?' out':'')+passedCls;
+    const badge=o.out
+      ? '<div style="font-size:11px;color:var(--muted);">выбыл</div>'
+      : '<div class="opp-back">&#x1F0A0;</div>';
+    div.innerHTML=`<div class="opp-name">${o.n}</div>`
+      + (label?`<div class="opp-role">${label}</div>`:'')
+      + badge;
+    opp.appendChild(div);
+  });
+
+  const ta=document.getElementById('tableArea');
+  ta.innerHTML='';
+  (d.table||[]).forEach((slot,i)=>{
+    const div=document.createElement('div');
+    div.className='slot'+(selectedSlot===i?' selected':'');
+    div.innerHTML=`<div class="atk ${suitColor(slot.a)}">${slot.a}</div>`;
+    if (slot.d) div.innerHTML+=`<div class="def ${suitColor(slot.d)}">${slot.d}</div>`;
+    div.onclick=()=>selectSlot(i);
+    ta.appendChild(div);
+  });
+
+  const canThrowIn = !isDef && !isAtk && d.table.length > 0;  // podkidnoy
+  const allDef = d.table.length>0 && d.table.every(s=>s.d);
+  const voteSuffix = (allDef && (d.passT||0)>0) ? ` (Бито: ${d.passN||0}/${d.passT||0})` : '';
+  let status='';
+  if (isAtk && allDef && d.iPassed) status='Вы готовы &mdash; ждём остальных';
+  else if (isAtk && allDef) status='Все карты побиты — нажмите «Бито» или подкиньте ещё';
+  else if (isAtk) status='Ваш ход — атакуйте';
+  else if (isDef && allDef) status='Защита успешна — ждём, пока все скажут «Бито»';
+  else if (isDef) status='Ваш ход — защищайтесь';
+  else if (canThrowIn && allDef && d.iPassed) status='Вы готовы &mdash; ждём остальных';
+  else if (canThrowIn && allDef) status='Все карты побиты — подкиньте или нажмите «Бито»';
+  else if (canThrowIn) status=`${d.atk} атакует — можете подкинуть`;
+  else status=`${d.atk} атакует ${d.def}`;
+  document.getElementById('statusBar').innerHTML=status+voteSuffix;
+
+  const ha=document.getElementById('handArea');
+  ha.innerHTML='';
+  (d.hand||[]).forEach(card=>{
+    const btn=document.createElement('button');
+    btn.className='card-btn'+(suitColor(card)?' red':'')+(selectedCard===card?' selected':'');
+    btn.textContent=card;
+    btn.onclick=()=>selectCard(card);
+    ha.appendChild(btn);
+  });
+
+  renderActions(isAtk, isDef, d);
+}
+
+function selectCard(card) {
+  selectedCard=(selectedCard===card)?null:card;
+  renderGame();
+}
+function selectSlot(i) {
+  selectedSlot=(selectedSlot===i)?-1:i;
+  renderGame();
+}
+
+function renderActions(isAtk, isDef, d) {
+  const ab=document.getElementById('actionBar');
+  ab.innerHTML='';
+  const canThrowIn = !isDef && !isAtk && d.table.length > 0;  // podkidnoy
+  const allDef = d.table.length>0 && d.table.every(s=>s.d);
+  if (isAtk || canThrowIn) {
+    if (selectedCard) {
+      const label = isAtk ? 'Атаковать' : 'Подкинуть';
+      ab.innerHTML+=`<button class="btn" onclick="doAttack()">${label} (${selectedCard})</button>`;
+    }
+    // Any non-defender votes "Бито"; the round ends only when everyone agrees.
+    if (allDef && !d.iPassed) {
+      const cls = selectedCard ? 'btn secondary' : 'btn';
+      ab.innerHTML+=`<button class="${cls}" onclick="doPass()">Бито (${(d.passN||0)+1}/${d.passT||0})</button>`;
+    }
+  }
+  if (isDef) {
+    if (selectedSlot>=0 && selectedCard) {
+      ab.innerHTML+=`<button class="btn" onclick="doDefend()">Защитить слот ${selectedSlot+1}</button>`;
+    }
+    // perevod requires a card selected, no slot defended yet, and at least
+    // one active opponent to receive the transfer (in 2-player, roles swap).
+    const activeOpps = (d.opp||[]).filter(o=>!o.out).length;
+    const canPerevod = selectedCard && d.table.length>0
+                       && !d.table.some(s=>s.d) && activeOpps >= 1;
+    if (canPerevod) {
+      ab.innerHTML+=`<button class="btn secondary" onclick="doPerevod()">Перевод</button>`;
+    }
+    ab.innerHTML+=`<button class="btn danger sm" onclick="doTake()">Взять</button>`;
+  }
+  ab.innerHTML+=`<button class="btn danger sm" onclick="leaveGame()">&#x2715; Выйти</button>`;
+}
+
+function doAttack() { if(selectedCard){ send({type:'attack',card:selectedCard}); selectedCard=null; } }
+function doDefend() { if(selectedCard&&selectedSlot>=0){ send({type:'defend',slot:selectedSlot,card:selectedCard}); selectedCard=null; selectedSlot=-1; } }
+function doPerevod() { if(selectedCard){ send({type:'perevod',card:selectedCard}); selectedCard=null; } }
+function doPass() { send({type:'pass'}); }
+function doTake() { send({type:'take'}); }
+
+function hostGame() {
+  document.getElementById('hostErr').textContent='';
+  send({type:'hostGame', deck:parseInt(document.getElementById('deckSel').value), jokers:document.getElementById('jokersCb').checked});
+}
+function joinGame() {
+  const code=document.getElementById('codeInput').value.trim();
+  if (code.length!==8) { document.getElementById('joinErr').textContent='Enter 8-digit code.'; return; }
+  document.getElementById('joinErr').textContent='';
+  send({type:'joinGame',code});
+}
+function joinByCode(code) { send({type:'joinGame',code}); }
+function startGame() { send({type:'startGame'}); }
+function leaveGame() { send({type:'leaveGame'}); inRoom=false; myRoomCode=''; show('viewLobby'); send({type:'getLobbies'}); }
+</script>
+</body>
+</html>
+)rawliteral";
+
+// ─────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
 
@@ -974,6 +1930,8 @@ void setup() {
 
   loadAccountsNVS();
   printAccounts();
+  loadModsNVS();
+  for (int i=0;i<MAX_GAMES;i++) games[i].active=false;
 
   WiFi.mode(WIFI_AP);
   WiFi.softAP(AP_SSID, AP_PASS);
@@ -1044,6 +2002,10 @@ void setup() {
   });
   server.on("/chat", HTTP_GET, [](AsyncWebServerRequest* req) {
     req->send_P(200, "text/html", CHAT_HTML);
+  });
+  server.on("/durak", HTTP_GET, [](AsyncWebServerRequest* req) {
+    if (!isSignedIn(req->client()->remoteIP())) { req->redirect("/"); return; }
+    req->send_P(200, "text/html", DURAK_HTML);
   });
 
   ws.onEvent(onWsEvent);
